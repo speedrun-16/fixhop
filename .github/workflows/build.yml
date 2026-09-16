@@ -1,0 +1,142 @@
+name: Build fixhop
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+# the build attaches its package to the rolling release, which needs write
+# access to repository contents. fork pull requests get a read-only token, so
+# every release step below is gated on the event not being a pull request
+permissions:
+  contents: write
+
+# the nightly tag is recreated on every run, so two runs of the same branch must
+# not overlap and race each other
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # one platform only, so the release is recreated inside the build job rather
+  # than in a separate one the way the engine repo needs
+  build-windows:
+    name: Build for Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Add MSVC to PATH
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      # hl.exe is x86, so the dll and the injector both have to be
+      - name: Configure CMake
+        run: cmake -S . -B build -A Win32
+
+      - name: Build with CMake
+        run: cmake --build build --config Release
+
+      # two packages, one per way of loading it. a player who wants the drop in
+      # route should not have to work out which of four files they need
+      - name: Package artifacts
+        shell: powershell
+        run: |
+          function Package($dir, $files) {
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            foreach ($name in $files) {
+              $path = "bin/$name"
+              if (-not (Test-Path -LiteralPath $path)) { throw "$path not found" }
+              Copy-Item $path -Destination $dir
+            }
+            Copy-Item "README.md" -Destination $dir
+          }
+
+          Package "package-asi/fixhop"      @("fixhop.asi")
+          Package "package-injector/fixhop" @("fixhop.dll", "inject.exe", "run.bat")
+
+          Compress-Archive -Path "package-asi/*"      -DestinationPath "fixhop-asi.zip"
+          Compress-Archive -Path "package-injector/*" -DestinationPath "fixhop-injector.zip"
+
+      # the run artifact is the convenient download but it draws on a storage
+      # quota that can run out; the release asset below is the durable copy, so
+      # a full quota must not fail the build
+      - name: Upload asi artifact
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: fixhop-asi
+          path: package-asi/
+
+      - name: Upload injector artifact
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: fixhop-injector
+          path: package-injector/
+
+      # gh reports "release not found" on stderr, and a github powershell step
+      # runs with $ErrorActionPreference = stop, which turns that into a fatal
+      # error. so the probes below relax it and read $LASTEXITCODE instead,
+      # which is the thing that actually says whether gh succeeded
+      - name: Move the nightly tag to this commit
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          # delete first: a release keeps its original tag even when edited, so
+          # recreating is the only way to move nightly onto the new commit. it
+          # does not exist yet on the first run, which is not a failure
+          gh release delete nightly --yes --cleanup-tag 2>&1 | Out-Null
+
+          gh release create nightly `
+            --target "$env:GITHUB_SHA" `
+            --title "Nightly build $($env:GITHUB_SHA.Substring(0,7))" `
+            --notes "Automatic build of master at $env:GITHUB_SHA.`n`nfixhop-asi.zip drops into the Half-Life directory and loads itself. fixhop-injector.zip is the run.bat and injector route." `
+            --prerelease
+          if ($LASTEXITCODE -ne 0) { throw "could not create the nightly release" }
+
+          gh release upload nightly "fixhop-asi.zip" "fixhop-injector.zip" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not attach the packages to nightly" }
+
+      # a release is cut by bumping VERSION in CMakeLists.txt and pushing.
+      # nothing else to remember: if the tag for that version already exists
+      # this is a no-op, so ordinary commits pass straight through
+      - name: Publish a release when the version changes
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          # the three part match skips cmake_minimum_required(VERSION 3.21)
+          $line = Select-String -Path CMakeLists.txt `
+                                -Pattern '^\s*VERSION\s+(\d+\.\d+\.\d+)\s*$' |
+                  Select-Object -First 1
+          if (-not $line) { throw "no three part VERSION found in CMakeLists.txt" }
+
+          $tag = "v" + $line.Matches[0].Groups[1].Value
+
+          gh release view $tag 2>&1 | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "$tag is already released, nothing to publish"
+            exit 0
+          }
+
+          Write-Host "publishing $tag"
+          gh release create $tag --target "$env:GITHUB_SHA" --title $tag --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "could not create $tag" }
+
+          gh release upload $tag "fixhop-asi.zip" "fixhop-injector.zip" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not attach the packages to $tag" }

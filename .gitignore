@@ -1,0 +1,13 @@
+build/
+
+# build outputs, next to the run.bat and fixhop.ini that are tracked
+bin/fixhop.dll
+bin/fixhop.asi
+bin/inject.exe
+bin/*.exp
+bin/*.lib
+bin/*.pdb
+bin/*.log
+
+# working notes, not shipped
+docs/
